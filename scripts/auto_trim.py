@@ -6,6 +6,7 @@ import argparse
 import subprocess
 import glob
 import shutil
+import json
 import numpy as np
 import cv2
 
@@ -61,6 +62,10 @@ def parse_args():
         "-d", "--dry-run", action="store_true",
         help="仅分析并打印裁剪时间点，不进行实际剪切"
     )
+    parser.add_argument(
+        "-j", "--json", action="store_true",
+        help="仅输出结构化 JSON 时间线数据文件而不实际裁剪视频，完美适配 Remotion/剪辑软件时间线。"
+    )
     return parser.parse_args()
 
 def get_ffmpeg_path():
@@ -97,7 +102,7 @@ def get_ffmpeg_path():
 
 def analyze_segment(video_path, start_time, duration, sample_fps=SAMPLE_FPS):
     """
-    分析指定时间段内的视频帧，返回每一帧的 (时间戳, 亮度, 运动强度)。
+    分析指定时间段内的视频帧，返回每一帧 of (时间戳, 亮度, 运动强度)。
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -385,20 +390,45 @@ def process_file(video_path, output_dir, args, ffmpeg_cmd):
     
     if t_start is None or t_end is None:
         print(f"[-] 视频分析失败。")
-        return False
+        return False, None
         
     cut_start_len = t_start
     cut_end_len = orig_dur - t_end
+    
+    # Calculate exact frame-level metrics for precise Remotion/React integration
+    total_frames_int = int(total_frames)
+    f_start = int(round(t_start * fps))
+    f_end = int(round(t_end * fps))
+    
+    # Ensure calculated frames are strictly within physical bounds
+    f_start = max(0, min(f_start, total_frames_int))
+    f_end = max(f_start, min(f_end, total_frames_int))
+    
+    result_dict = {
+        "fps": float(fps),
+        "total_frames": total_frames_int,
+        "duration_seconds": float(f"{orig_dur:.3f}"),
+        "t_start": float(f"{t_start:.3f}"),
+        "t_end": float(f"{t_end:.3f}"),
+        "f_start": f_start,
+        "f_end": f_end,
+        "active_duration_seconds": float(f"{(t_end - t_start):.3f}"),
+        "active_duration_frames": f_end - f_start,
+        "trim_start_seconds": float(f"{cut_start_len:.3f}"),
+        "trim_start_frames": f_start,
+        "trim_end_seconds": float(f"{cut_end_len:.3f}"),
+        "trim_end_frames": total_frames_int - f_end
+    }
     
     if cut_start_len <= 0.05 and cut_end_len <= 0.05:
         print("[提示] 该视频前后均无明显垃圾片段，无需进行裁剪剪切。")
         # 复制原文件到输出目录以保持批处理完整性
         out_path = os.path.join(output_dir, filename)
-        if not args.dry_run:
+        if not args.dry_run and not args.json:
             print(f"复制原文件到输出文件夹...")
             shutil.copy2(video_path, out_path)
             print(f"[+] 处理完成！已保持原样输出。")
-        return True
+        return True, result_dict
         
     out_path = os.path.join(output_dir, filename)
     print(f"[决策] 智能识别决策:")
@@ -407,8 +437,12 @@ def process_file(video_path, output_dir, args, ffmpeg_cmd):
     print(f"   - 正片区间: {t_start:.2f}s 至 {t_end:.2f}s (共计 {t_end - t_start:.2f} 秒)")
     
     if args.dry_run:
-        print("[Dry Run] 仅进行算法分析，不写入新文件。")
-        return True
+        print("[Dry Run] 仅进行算法分析，不写入新视频文件。")
+        return True, result_dict
+        
+    if args.json:
+        print("[JSON 模式] 仅保存时间线参数，不进行视频文件实体裁剪。")
+        return True, result_dict
         
     # 执行实际裁剪
     print("[剪切] 正在进行无损快速剪切...")
@@ -422,17 +456,17 @@ def process_file(video_path, output_dir, args, ffmpeg_cmd):
         print(f"   - 原文件大小: {orig_size:.2f} MB")
         print(f"   - 脱水后大小: {new_size:.2f} MB")
         print(f"   - 输出路径: {out_path}")
-        return True
+        return True, result_dict
     else:
         print("[-] 视频裁剪失败！")
-        return False
+        return False, None
 
 def main():
     args = parse_args()
     
-    # 查找本地 FFmpeg 工具
+    # 查找本地 FFmpeg 工具 (仅在不使用 --json 时为必填)
     ffmpeg_cmd = get_ffmpeg_path()
-    if ffmpeg_cmd is None and not args.dry_run:
+    if ffmpeg_cmd is None and not args.dry_run and not args.json:
         print("[-] 无法找到可用的 FFmpeg！请先在系统中安装 ffmpeg，或者确保 node 项目里安装了 Remotion 包。")
         sys.exit(1)
         
@@ -482,15 +516,26 @@ def main():
         
     success_count = 0
     total_start_time = time.time()
+    metadata_results = {}
     
     for video_file in files_to_process:
         if os.path.basename(video_file).startswith("._"):
             continue
         try:
-            if process_file(video_file, output_dir, args, ffmpeg_cmd):
+            success, result_dict = process_file(video_file, output_dir, args, ffmpeg_cmd)
+            if success:
                 success_count += 1
+                if result_dict is not None:
+                    metadata_results[os.path.basename(video_file)] = result_dict
         except Exception as e:
             print(f"[-] 处理文件 {os.path.basename(video_file)} 时发生异常: {str(e)}")
+            
+    # 将汇总的时间线元数据写入 JSON 文件
+    if not args.dry_run and metadata_results:
+        json_path = os.path.join(output_dir, "trim_metadata.json")
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata_results, f, indent=2, ensure_ascii=False)
+        print(f"\n[+] 成功导出结构化时间线元数据至: {json_path}")
             
     total_elapsed = time.time() - total_start_time
     print(f"\n==========================================")
